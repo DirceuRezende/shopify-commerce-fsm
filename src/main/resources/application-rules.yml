@@ -1,0 +1,4 @@
+# Use --spring.profiles.active=rules to classify user text with simple Java heuristics.
+# Tools INSIDE Search/Cart/Checkout still require an LLM and OPENAI_API_KEY.
+commerce:
+  intent-mode: rules

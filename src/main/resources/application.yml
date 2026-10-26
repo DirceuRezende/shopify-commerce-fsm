@@ -8,6 +8,17 @@ spring:
     model:
       chat: none
       embedding: none
+    mcp:
+      client:
+        type: SYNC
+        toolcallback:
+          enabled: true
+        request-timeout: 30s
+        streamable-http:
+          connections:
+            shopify:
+              url: ${UCP_SERVER_BASE_URL:http://localhost:8090}
+              endpoint: ${UCP_MCP_PATH:/api/ucp/mcp}
 management:
   endpoints:
     web:

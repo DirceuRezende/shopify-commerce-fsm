@@ -3,67 +3,80 @@ package com.example.commerce.graph;
 import com.example.commerce.domain.CommerceCommand;
 import com.example.commerce.domain.CommerceStateMachine;
 import com.example.commerce.domain.ProductChoice;
-import com.example.commerce.ucp.UcpGateway;
+import com.example.commerce.mcp.InvocationLog;
+import com.example.commerce.mcp.ScopedTools;
+import com.example.commerce.mcp.UcpPayloads;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.stereotype.Component;
-
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+/** LLM chooses remote Cart MCP tools, never changes cartStatus by itself. */
 @Component
 public class CartNode {
-    private final UcpGateway gateway;
-    private final CommerceStateMachine machine;
-    public CartNode(UcpGateway gateway, CommerceStateMachine machine) {
-        this.gateway = gateway;
-        this.machine = machine;
+    private final ChatClient chat;
+    private final ScopedTools tools;
+    private final ObjectMapper mapper;
+    private final CommerceStateMachine fsm;
+    public CartNode(ChatModel model, ScopedTools tools, ObjectMapper mapper, CommerceStateMachine fsm) {
+        this.chat = ChatClient.create(model); this.tools = tools; this.mapper = mapper; this.fsm = fsm;
     }
 
     public Map<String, Object> execute(CommerceState state) {
         try {
-            if (!state.supports("get_cart") || !state.supports("create_cart") || !state.supports("update_cart"))
-                throw new IllegalStateException("Tools de carrinho não anunciadas no MCP");
-            if (state.command() == CommerceCommand.VIEW_CART) {
-                if (state.cartId().isBlank())
-                    return Map.of("reply", "Seu carrinho está vazio.");
-                var current = gateway.getCart(state.endpoint(), state.cartId());
-                return Map.of("reply", "Carrinho com " + current.items().size() +
-                    " tipo(s) de item(ns). Link: " + current.continueUrl());
+            var command = state.command();
+            var allowed = switch (command) {
+                case ADD_TO_CART -> state.cartId().isBlank() ? Set.of("create_cart")
+                    : Set.of("get_cart", "update_cart");
+                case REMOVE_FROM_CART -> Set.of("get_cart", "update_cart");
+                case VIEW_CART -> Set.of("get_cart");
+                default -> throw new IllegalArgumentException("Evento não é de carrinho");
+            };
+            String variant = "";
+            if (command == CommerceCommand.ADD_TO_CART || command == CommerceCommand.REMOVE_FROM_CART)
+                variant = ProductChoice.select(state.string("productReference"), state.searchResults());
+            if (command != CommerceCommand.ADD_TO_CART && state.cartId().isBlank())
+                throw new IllegalStateException("Não existe carrinho ativo");
+            var log = new InvocationLog();
+            var reply = chat.prompt()
+                .system("""
+                    Você é o agente de carrinho de uma loja Shopify.
+                    As ferramentas são o Cart MCP REAL, com seus schemas oficiais.
+                    Utilize uma ferramenta apropriada; não invente IDs. Para update_cart,
+                    obtenha o carrinho e mantenha todos os line_items/context/buyer necessários:
+                    update_cart substitui o documento do carrinho, não é um PATCH parcial.
+                    Não simule sucesso e não invoque checkout.
+                    """)
+                .user("Evento=" + command + "; variante autorizada=" + variant +
+                    "; quantidade=" + state.quantity() + "; cartId=" + state.cartId() +
+                    "; instrução original=" + state.string("userMessage"))
+                .tools(tools.forNode(allowed, state, log))
+                .call().content();
+            var mutation = log.last(state.cartId().isBlank() ? "create_cart" : "update_cart");
+            if (command == CommerceCommand.VIEW_CART) {
+                var read = log.last("get_cart");
+                if (read == null) throw new IllegalStateException("get_cart não foi chamada");
+                var payload = UcpPayloads.decode(mapper, read.rawResult());
+                return Map.of("reply", reply == null ? "Carrinho consultado." : reply,
+                    "cartId", UcpPayloads.id(UcpPayloads.core(payload)));
             }
-
-            String variant = ProductChoice.select(state.string("productReference"), state.searchResults());
-            var lines = new ArrayList<UcpGateway.LineItem>();
-            if (!state.cartId().isBlank()) lines.addAll(gateway.getCart(state.endpoint(), state.cartId()).items());
-            int existing = -1;
-            for (int i = 0; i < lines.size(); i++) {
-                if (variant.equals(lines.get(i).variantId())) { existing = i; break; }
-            }
-
-            if (state.command() == CommerceCommand.ADD_TO_CART) {
-                int quantity = state.quantity();
-                if (quantity < 1 || quantity > 99) throw new IllegalArgumentException("Quantidade deve estar entre 1 e 99.");
-                if (existing >= 0) lines.set(existing, new UcpGateway.LineItem(variant, lines.get(existing).quantity() + quantity));
-                else lines.add(new UcpGateway.LineItem(variant, quantity));
-            } else if (state.command() == CommerceCommand.REMOVE_FROM_CART) {
-                if (existing < 0) throw new IllegalArgumentException("Variante não existe no carrinho.");
-                lines.remove(existing);
-            } else throw new IllegalArgumentException("Comando não autorizado para CartNode");
-
-            UcpGateway.Cart updated = state.cartId().isBlank()
-                ? gateway.createCart(state.endpoint(), lines)
-                : gateway.replaceCart(state.endpoint(), state.cartId(), lines);
-            var next = machine.cartChanged(state.businessState(), !updated.items().isEmpty());
+            if (mutation == null) throw new IllegalStateException("A LLM não executou a mutação solicitada");
+            var payload = UcpPayloads.core(UcpPayloads.decode(mapper, mutation.rawResult()));
+            var id = UcpPayloads.id(payload);
+            if (!UcpPayloads.hasCartItems(payload) && !payload.path("line_items").isArray())
+                throw new IllegalStateException("MCP não forneceu line_items confirmados");
+            var next = fsm.cartChanged(state.businessState(), UcpPayloads.hasCartItems(payload));
             return Map.of(
-                "cartId", updated.id(),
+                "cartId", id,
                 "cartStatus", next.cart().name(),
                 "checkoutStatus", next.checkout().name(),
-                "checkoutId", "", // Cart mutation invalidates pending checkout.
+                "checkoutId", "",
                 "checkoutUrl", "",
-                "reply", "Carrinho atualizado com sucesso. " + updated.items().size()
-                    + " tipo(s) de item(ns). " + updated.continueUrl()
-            );
-        } catch (RuntimeException ex) {
-            return Map.of("error", "CART_FAILED", "reply", "Não alterei o carrinho: " + ex.getMessage());
+                "reply", reply == null ? "Carrinho atualizado." : reply);
+        } catch (Exception e) {
+            return Map.of("error", "CART_FAILED", "reply", "Não alterei o carrinho: " + e.getMessage());
         }
     }
 }

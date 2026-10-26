@@ -1,167 +1,147 @@
-# Shopify Commerce FSM — Spring Boot 4 / Java 25 / Spring AI / LangGraph4j / MongoDB
+# Shopify Commerce — MCP Client único + FSM + LangGraph4j
 
-Projeto de estudo: chatbot de comércio conversacional **sem SupervisorNode**, com roteamento controlado por enums e **FSM 100% Java**. A interpretação da frase do usuário pode usar Spring AI, mas **a IA nunca define `cartStatus` nem `checkoutStatus`**. O backend só altera estado após sucesso da operação da loja.
+Starter de estudos em **Java 25 / Spring Boot 4.0.2 / Spring AI 2.0.1 / LangGraph4j 1.9.6 / MongoDB**. Inclui **um único MCP Client** apontando para um UCP Server (a Shopify ou o mock de desenvolvimento). Não há `SupervisorNode`, registro por lojista, nem implementações locais das tools reais.
 
-> **Escopo deste starter:** busca do catálogo, adicionar/remover itens, consultar carrinho e **criar checkout com URL para revisão do comprador**. Não executa `complete_checkout`, captura de cartão, aprovação automática, reembolso ou pagamento.
+> **Escopo:** busca no catálogo, carrinho e **preparação** do checkout. `complete_checkout`, pagamentos e operações destrutivas não são disponibilizados à LLM. A integração de autenticação do Checkout MCP da Shopify **não está implementada**; use o mock para testar esse passo, ou configure seu transporte autenticado antes de testar na Shopify real.
 
 ## Arquitetura
 
 ```mermaid
 flowchart TD
-    API[POST /api/chat] --> Intent{Comando explícito?}
-    Intent -->|sim| CMD[Comando estruturado]
-    Intent -->|não| NLP[Rules ou Spring AI: extrair intent]
-    CMD --> LG[LangGraph4j: START]
-    NLP --> LG
-    LG --> DISC[DiscoveryNode UCP]
-    DISC --> EDGE{Conditional Edge Java}
-    EDGE -->|SEARCH| SEARCH[SearchNode]
-    EDGE -->|CART| CART[CartNode]
-    EDGE -->|CHECKOUT| CHECK[CheckoutNode]
-    EDGE -->|UNKNOWN/erro| RESP[ResponseNode]
-    SEARCH --> RESP
-    CART --> FSM[FSM Java e guards]
-    CHECK --> FSM
-    FSM --> RESP
-    RESP --> END[END + MongoDB checkpoint]
+    A[POST /api/chat] --> B[Spring AI: extrai comando ou comando explícito]
+    B --> C[LangGraph4j START]
+    C --> D[DiscoveryNode: tools/list e validação opcional do well-known]
+    D --> E{Conditional Edge Java}
+    E -->|SEARCH| F[SearchNode + LLM + ferramentas de catálogo]
+    E -->|CART| G[CartNode + LLM + ferramentas de carrinho]
+    E -->|CHECKOUT| H[CheckoutNode + LLM + create_checkout]
+    E -->|UNKNOWN| I[ResponseNode]
+    F --> I
+    G --> J[FSM Java após resposta MCP]
+    H --> J
+    J --> I
+    I --> K[END / MongoDB checkpoint]
 ```
 
-### Responsabilidades
+- `SyncMcpToolCallbackProvider`: converte as ferramentas reais do `tools/list` em `ToolCallback` (não existe `@Tool` espelhando a API da Shopify).
+- `McpToolCatalog`: filtra as callbacks de **um único servidor**, por domínio.
+- `GuardedMcpTool`: **decorador** do callback remoto, acrescenta `meta["ucp-agent"].profile`, valida argumentos, restringe ferramentas e registra resultados MCP; **não recria a tool no backend**.
+- `CommerceStateMachine`: estados do carrinho/checkout mudam somente após resposta MCP estruturada validada (veja limitações de confirmação em produção abaixo).
+- `CommerceGraphConfiguration`: aresta condicional Java, sem agente supervisor.
+- `MongoDBSaver`: mantém checkpoints por `threadId`/`conversationId`.
 
-| Componente | Função |
-|---|---|
-| `IntentExtractor` | Extrai `CommerceCommand`, query, número da variante; não modifica estado |
-| `CommerceStateMachine` | Guardas de checkout, estado do carrinho e invalidação de checkout depois de alteração |
-| `CommerceGraphConfiguration` | Aresta condicional pura, **sem LLM supervisor** |
-| `CommerceState` | Contexto persistido por thread no MongoDB Saver |
-| `DiscoveryNode` | Lê o well-known UCP (modo real) e retorna endpoint MCP e descobre as tools com `tools/list` |
-| `SearchNode` | Somente catálogo (`search_catalog`) |
-| `CartNode` | Somente carrinho (`create_cart`, `get_cart`, `update_cart`) |
-| `CheckoutNode` | **Somente** `create_checkout` |
-| `UcpGateway` | Port com `MockUcpGateway` e `ShopifyUcpGateway` |
+**Trade-off:** o roteamento e as transições da FSM são determinísticos. A seleção de tools e a formulação dos argumentos **dentro do agente** continuam probabilísticas e, por isso, são validadas no backend.
 
 ## Pré-requisitos
 
-- **Java 25** e **Maven 3.9+** (ou Docker para compilar com Java 25).
-- **Docker Compose** para subir MongoDB.
-- Opcional: chave OpenAI, uma loja Shopify com UCP e credenciais de checkout para os modos reais.
+- Docker e Docker Compose, ou Java 25 + Maven 3.9+.
+- `OPENAI_API_KEY` para executar os nós LLM (inclusive usando comando estruturado).
+- Um UCP Server MCP com Streamable HTTP. Para desenvolvimento, o mock opcional já acompanha o projeto.
 
-## Executar demo offline (sem OpenAI e sem Shopify)
+## Teste local com apenas um UCP Server simulado
+
+### Rodando Spring Boot localmente
 
 ```bash
-docker compose up -d mongo
+# Na pasta do projeto
+docker compose --profile demo up -d mongo mock-ucp
+export OPENAI_API_KEY='sua-chave'
 mvn test
 mvn spring-boot:run
 ```
 
-Alternativa sem instalar Java/Maven localmente:
+- MongoDB: `localhost:27017`.
+- UCP mock: `http://localhost:8090/api/ucp/mcp`.
+- App: `http://localhost:8080/api/chat`.
+- `Mock UCP` é um servidor remoto separado, implementado em `mock-ucp/server.py` apenas para exercitar o **cliente MCP real**. O aplicativo Java **não cria nenhuma ferramenta de comércio**.
 
-```bash
-docker compose --profile app up --build
-```
-
-API: `http://localhost:8080/api/chat` e healthcheck `http://localhost:8080/actuator/health`.
-
-### 1. Busca
-
-```bash
-curl -s http://localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversationId":"demo-1","command":"SEARCH","query":"tênis"}'
-```
-
-### 2. Adicionar o segundo resultado
-
-```bash
-curl -s http://localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversationId":"demo-1","command":"ADD_TO_CART","productReference":"2","quantity":1}'
-```
-
-### 3. Consultar carrinho
-
-```bash
-curl -s http://localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversationId":"demo-1","command":"VIEW_CART"}'
-```
-
-### 4. Preparar checkout (NÃO finaliza pagamento)
-
-```bash
-curl -s http://localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversationId":"demo-1","command":"CREATE_CHECKOUT"}'
-```
-
-### 5. Mensagem natural em modo rules
-
-```bash
-curl -s http://localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversationId":"demo-2","message":"Quero um tênis"}'
-```
-
-O parser `RuleIntentExtractor` é propositalmente simples (algumas frases em português); para **determinismo completo de ponta a ponta, envie `command` e parâmetros explícitos**. Para interpretar texto livre, ligue o perfil `ai`.
-
-## Usar extração de intenção pelo Spring AI
+### Rodando a aplicação inteira no Docker
 
 ```bash
 export OPENAI_API_KEY='sua-chave'
-SPRING_PROFILES_ACTIVE=ai mvn spring-boot:run
+docker compose --profile app up --build
 ```
 
-A configuração `spring.ai.model.chat=none` no perfil padrão permite rodar a demo sem precisar da chave. Em `ai`, o Spring AI chama o modelo via `ChatClient.entity(IntentData.class)`. A LLM pode errar a extração, então o backend **valida o comando e os guards**, e `UNKNOWN` não executa side effects.
+O profile `app` sobe `mongo`, `mock-ucp` e a aplicação. No Docker, a URL da conexão MCP será `http://mock-ucp:8090`.
 
-## Usar uma loja Shopify UCP real
+## Chamando a API
 
-Configure as variáveis, sem as adicionar ao Git:
+Use sempre o mesmo `conversationId` para continuar o estado persistido:
 
 ```bash
-export COMMERCE_MODE=shopify
-export SHOPIFY_MERCHANT_ORIGIN='https://SUA-LOJA.myshopify.com'
-export UCP_AGENT_PROFILE_URL='https://URL-PUBLICA-DO-SEU-AGENT-PROFILE/.well-known/ucp'
-export SHOPIFY_CHECKOUT_BEARER_TOKEN='token-de-checkout'   # Apenas para criar checkout
+curl -X POST http://localhost:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"conversationId":"teste-1","command":"SEARCH","query":"tênis","message":"Encontre tênis"}'
+```
+
+Depois escolha o segundo resultado da busca:
+
+```bash
+curl -X POST http://localhost:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"conversationId":"teste-1","command":"ADD_TO_CART","productReference":"2","quantity":1,"message":"Adicione o segundo ao carrinho"}'
+```
+
+```bash
+curl -X POST http://localhost:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"conversationId":"teste-1","command":"VIEW_CART"}'
+```
+
+```bash
+curl -X POST http://localhost:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"conversationId":"teste-1","command":"CREATE_CHECKOUT"}'
+```
+
+Há requisições adicionais em `examples/requests.http`. Se omitir `command`, o `SpringAiIntentExtractor` usará Spring AI para converter a mensagem para um comando estruturado; ele **não modifica estados comerciais**. Para testar extração por regras simples, use `--spring.profiles.active=rules` (os agentes continuam chamando a LLM).
+
+## Conectar a uma única loja Shopify
+
+```bash
+export OPENAI_API_KEY='sua-chave'
+export SHOPIFY_MERCHANT_ORIGIN='https://sua-loja.myshopify.com'
+export UCP_SERVER_BASE_URL='https://sua-loja.myshopify.com'
+export UCP_MCP_PATH='/api/ucp/mcp'
+export UCP_AGENT_PROFILE_URL='https://seu-agente.example/.well-known/ucp'
+export UCP_VERIFY_WELL_KNOWN=true
 mvn spring-boot:run
 ```
 
-- `DiscoveryNode`: consulta as tools por `tools/list` e requisita `https://loja/.well-known/ucp`, consulta `ucp.services["dev.ucp.shopping"][]`, seleciona `transport=mcp` e valida origem HTTPS.
-- `ShopifyUcpGateway`: implementa **o binding JSON-RPC das tools Shopify UCP**, enviando `meta["ucp-agent"].profile` em todas as tools. Para uma única loja isso é mais enxuto do que um MCP client genérico.
-- `search_catalog`: envia `catalog.query` e captura variante **somente** se a API retornar `ProductVariant` no resultado. Se não houver variante explícita, o backend pede seleção detalhada, não cria ID fictício.
-- `create_cart` / `get_cart` / `update_cart`: manipula `cart.line_items`; **`update_cart` substitui o carrinho completo**, então o adapter recupera e preserva `context`, `buyer`, `attribution`, `signals` antes da atualização.
-- `create_checkout`: exige bearer token externo, usa `checkout.cart_id`; devolve `continue_url` ao comprador. OAuth Client Credentials / HTTP Message Signatures são responsabilidades da camada de autenticação, **não implementadas** nesta versão.
+**Atenção:** o MCP Client é inicializado pelo Spring AI na subida da aplicação a partir de `UCP_SERVER_BASE_URL` e `UCP_MCP_PATH`. A etapa `DiscoveryNode` confere `tools/list` e, quando habilitado, **valida** se `/.well-known/ucp` publica a mesma URL. Ela não reconfigura um cliente conectado dinamicamente depois da inicialização.
 
-**Importante:** Shopify pode publicar extensões, autenticação e schemas diferentes por merchant/capability. Valide `tools/list` e os schemas reais para a loja antes de habilitar em produção. Este é um adapter de exemplo, não um cliente MCP genérico completo nem implementação de negociação automática de toda a especificação UCP. Em particular, busca com produtos que não exponham a variante requer `get_product` e seleção explícita antes de adicionar ao carrinho (não implementado no starter).
+- A Shopify exige um UCP Agent Profile válido (`meta["ucp-agent"].profile`). Um URL fictício não basta em produção.
+- **Checkout MCP exige Bearer token ou assinatura HTTP** (e pode exigir header `Shopify-Buyer-IP` nas requisições de bearer). Adapte o transporte Spring MCP para incluir autenticação segura **antes** de habilitar `CREATE_CHECKOUT` na Shopify real. O projeto não promete suportar checkout real sem essa etapa.
+- `update_cart` tem **semântica de substituição completa**. O código exige `get_cart` no mesmo turno, preserva os outros itens e verifica campos de contexto antes de aceitar `update_cart`; valide também regras específicas da sua loja.
+- O callback MCP do Spring AI 2.0.1 pode expor ao consumidor só `content` e não `structuredContent`/`isError` completos. `UcpPayloads` analisa o texto JSON de resposta e detecta erros estruturados comuns, mas **essa implementação não substitui a confirmação transacional e reconciliação direta com a Shopify**. Antes de produção, utilize `McpSyncClient.callTool` para conferir `isError` e `structuredContent` originais e reconcilie operações por idempotency keys.
+- Os produtos provenientes da busca podem não expor diretamente uma variante. `ProductChoice` recusa adicionar produto sem `ProductVariant` conhecido. Use `get_product` para detalhamento.
+- Não armazene credenciais ou dados de cartão no estado. Não execute pagamento automaticamente.
 
-**Segurança:** o merchant é configurado pelo operador, não recebido via payload arbitrário (evita SSRF). O endpoint MCP deve ter HTTPS e o mesmo hostname da loja. Para produção também imponha allowlist dos domínios de merchants, limites de chamadas/tamanho de resposta e limites de catálogo por tenant. Checkout exige sessão/autorização adequada do comprador; esta demo somente prepara um checkout. O profile `UCP_AGENT_PROFILE_URL` precisa ser uma URL pública válida com capacidades compatíveis.
+## Testes e estrutura
 
-## Observabilidade e MongoDB
+```text
+src/main/java/com/example/commerce/
+  api/       ChatController, ChatService, DTOs
+  config/    CommerceGraphConfiguration (MongoDB + arestas condicionais)
+  domain/    CommerceStateMachine, status enums, ProductChoice
+  graph/     CommerceState, DiscoveryNode, SearchNode, CartNode, CheckoutNode, ResponseNode
+  intent/    SpringAiIntentExtractor (opcional parser de regras)
+  mcp/       McpToolCatalog, ScopedTools, GuardedMcpTool, InvocationLog, UcpPayloads
+mock-ucp/    Servidor MCP HTTP fake para testes com a LLM
+```
 
-Os checkpoints ficam em `commerce_graph.lg4j_thread` e `commerce_graph.lg4j_checkpoint` (prefixo padrão). `threadId=conversationId` recupera o estado entre requisições e `releaseThread(false)` preserva a thread ativa.
+Testes JUnit: FSM, resolução de produtos, parser MCP, proteção dos callbacks e verificação do meta UCP.
 
-`CartStatus`: `EMPTY` ou `ACTIVE`. `CheckoutStatus`: `NONE`, `AWAITING_BUYER`, `COMPLETED` (o último é apenas modelado: nenhum pagamento é executado neste projeto). Alterar carrinho invalida checkout pendente.
+**Limitações de produção:** autenticação do endpoint REST, isolamento de conversas por usuário, idempotência durável nas mutações, locks distribuídos por thread, retomada após crash entre chamada MCP e checkpoint, limites de taxa, resposta e ações, gestão de permissões e tratamento de dados privados. A implementação de exemplo utiliza lock local por conversa e não resolve múltiplas instâncias.
 
-**Atenção sobre o modo mock:** os carrinhos simulados ficam em memória. Checkpoints persistem no MongoDB, mas reiniciar a aplicação apaga os carrinhos mock. Em loja real, carrinhos existem na Shopify; para um mock durável, persista seu repositório separadamente.
+## Referências
 
-## Próximas evoluções de produção
+- [Spring AI MCP Client](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-client-boot-starter-docs.html)
+- [Spring AI Tool Calling](https://docs.spring.io/spring-ai/reference/api/tools.html)
+- [LangGraph4j MongoDB Saver](https://langgraph4j.github.io/langgraph4j/main/core/mongodb-saver/)
+- [Shopify Cart MCP](https://shopify.dev/docs/agents/carts-and-checkout/cart-mcp)
+- [Shopify Checkout MCP](https://shopify.dev/docs/agents/carts-and-checkout/checkout-mcp)
 
-- Resolver variantes com `get_product`, `lookup_catalog`, validação de estoque e confirmação explícita quando seleção for ambígua.
-- OAuth Client Credentials / assinaturas HTTP e expiração/rotação de tokens; perfil UCP próprio hospedado.
-- Registro/idempotência por comando, locks **distribuídos** por `conversationId` e deduplicação no caso de retry após checkpoint.
-- Autenticação do REST endpoint e vínculo `conversationId` ↔ usuário/tenant; nunca aceitar um ID de conversa não autorizado.
-- Checkpoint TTL, resumo de mensagens, caching/TTL para discovery, rate limiting e sanitização de erros/logs.
-- Webhook/polling para conciliação de checkout concluído, consentimento de pagamento e escalonamento ao storefront.
-- Testes de integração com MongoDB/Testcontainers e ambiente sandbox de Shopify antes de habilitar em produção.
+## Status de validação
 
-## Referências oficiais consultadas (outubro/2026)
-
-- https://langgraph4j.github.io/langgraph4j/main/core/core-library/
-- https://langgraph4j.github.io/langgraph4j/main/core/mongodb-saver/
-- https://spring.io/blog/2026/06/12/spring-ai-2-0-0-GA-available-now/
-- https://shopify.dev/docs/agents/catalog/storefront-catalog
-- https://shopify.dev/docs/agents/carts-and-checkout/cart-mcp
-- https://shopify.dev/docs/agents/carts-and-checkout/checkout-mcp
-
-## Transparência da validação
-
-Estrutura e arquivos gerados em 25/10/2026. As APIs foram conferidas na documentação, mas este ambiente não tem Maven, JDK 25 nem acesso à Maven Central para executar `mvn test`/`mvn package`. Execute os comandos de compilação e teste na sua máquina ou com Docker e ajuste eventuais diferenças de dependência antes de uso em produção.
+Este starter foi inspecionado estruturalmente e o servidor mock foi submetido a testes HTTP/JSON-RPC locais. **O `mvn test` e o build Java 25 não foram executados neste ambiente** (há JDK 21, sem Maven). Execute-os na sua máquina ou Docker; o código deve ser tratado como base de estudo/teste, e não integração Shopify homologada.
