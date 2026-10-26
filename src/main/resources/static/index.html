@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Commerce Chat</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --surface: #fff; --text: #1c1e21; --muted: #6b7280;
+    --primary: #2563eb; --primary-text: #fff; --bot: #e9ecf1; --border: #d9dde3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111418; --surface: #1b1f26; --text: #e8eaed; --muted: #9aa0a6;
+            --primary: #3b82f6; --bot: #262b34; --border: #333a45; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, sans-serif; height: 100dvh; display: flex; justify-content: center; }
+  .app { width: 100%; max-width: 720px; display: flex; flex-direction: column; background: var(--surface);
+         border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 16px; margin: 0; }
+  header button { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 85%; padding: 9px 13px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--primary); color: var(--primary-text); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.err { align-self: flex-start; background: #fde8e8; color: #9b1c1c; }
+  .msg a { color: inherit; font-weight: 600; }
+  .options { align-self: flex-start; display: flex; flex-wrap: wrap; gap: 8px; max-width: 95%; }
+  .opt { border: 1px solid var(--primary); background: transparent; color: var(--primary); border-radius: 18px;
+         padding: 7px 14px; cursor: pointer; font: inherit; text-align: left; }
+  .opt:hover:not(:disabled) { background: var(--primary); color: var(--primary-text); }
+  .opt small { display: block; opacity: .8; }
+  .opt:disabled { opacity: .45; cursor: default; }
+  .quick { padding: 8px 16px 0; display: flex; flex-wrap: wrap; gap: 8px; }
+  form { display: flex; gap: 8px; padding: 12px 16px; }
+  input[type=text] { flex: 1; padding: 10px 14px; border-radius: 20px; border: 1px solid var(--border);
+                     background: var(--bg); color: var(--text); font: inherit; }
+  form button { border: 0; background: var(--primary); color: var(--primary-text); border-radius: 20px; padding: 0 18px; font: inherit; cursor: pointer; }
+  form button:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header><h1>🛍️ Commerce Chat</h1><button id="reset" type="button">Nova conversa</button></header>
+  <div id="log" aria-live="polite"></div>
+  <div class="quick" id="quick"></div>
+  <form id="form" autocomplete="off">
+    <input type="text" id="input" placeholder="Escreva uma mensagem… (ex.: quero um tênis)" aria-label="Mensagem">
+    <button type="submit" id="send">Enviar</button>
+  </form>
+</div>
+<script>
+const log = document.getElementById('log');
+const input = document.getElementById('input');
+const send = document.getElementById('send');
+const quick = document.getElementById('quick');
+
+let conversationId = sessionStorage.getItem('conversationId');
+if (!conversationId) {
+  conversationId = crypto.randomUUID();
+  sessionStorage.setItem('conversationId', conversationId);
+}
+
+const QUICK_ACTIONS = [
+  { label: '🔍 Buscar tênis', body: { command: 'SEARCH', query: 'tênis' }, say: 'Buscar tênis' },
+  { label: '🔍 Buscar camiseta', body: { command: 'SEARCH', query: 'camiseta' }, say: 'Buscar camiseta' },
+  { label: '🛒 Ver carrinho', body: { command: 'VIEW_CART' }, say: 'Ver carrinho' },
+  { label: '✅ Finalizar compra', body: { command: 'CREATE_CHECKOUT' }, say: 'Finalizar compra' },
+];
+
+function bubble(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+  log.appendChild(el);
+  scroll();
+  return el;
+}
+
+function scroll() { log.scrollTop = log.scrollHeight; }
+
+function linkify(el) {
+  el.innerHTML = el.innerHTML.replace(/(https?:\/\/[^\s<]+)/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+
+function disableOptions() {
+  document.querySelectorAll('.options .opt').forEach(b => b.disabled = true);
+}
+
+function renderOptions(results) {
+  const box = document.createElement('div');
+  box.className = 'options';
+  results.forEach((p, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'opt';
+    const title = document.createElement('span');
+    title.textContent = `${i + 1}. ${p.title}`;
+    const price = document.createElement('small');
+    price.textContent = `${p.price} · adicionar ao carrinho`;
+    b.append(title, price);
+    b.onclick = () => post({ command: 'ADD_TO_CART', productReference: String(i + 1), quantity: 1 },
+                           `Adicionar: ${p.title}`);
+    box.appendChild(b);
+  });
+  log.appendChild(box);
+  scroll();
+}
+
+async function post(body, shown) {
+  disableOptions();
+  bubble(shown, 'user');
+  setBusy(true);
+  const wait = bubble('…', 'bot');
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId, ...body }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.message || `Erro ${res.status}`);
+    wait.textContent = data.reply || '(sem resposta)';
+    linkify(wait);
+    if (data.command === 'SEARCH' && data.searchResults?.length) renderOptions(data.searchResults);
+  } catch (e) {
+    wait.className = 'msg err';
+    wait.textContent = e.message;
+  } finally {
+    setBusy(false);
+    input.focus();
+  }
+}
+
+function setBusy(b) { send.disabled = b; input.disabled = b; quick.querySelectorAll('button').forEach(x => x.disabled = b); }
+
+QUICK_ACTIONS.forEach(a => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'opt'; b.textContent = a.label;
+  b.onclick = () => post(a.body, a.say);
+  quick.appendChild(b);
+});
+
+document.getElementById('form').addEventListener('submit', e => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  post({ message: text }, text);
+});
+
+document.getElementById('reset').onclick = () => {
+  sessionStorage.removeItem('conversationId');
+  location.reload();
+};
+
+bubble('Olá! Escreva o que procura ou escolha uma das opções abaixo.', 'bot');
+</script>
+</body>
+</html>
