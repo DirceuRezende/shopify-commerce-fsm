@@ -1,0 +1,22 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: shopify-commerce-fsm
+  # Disables model auto-initialization in offline demo. Run with --spring.profiles.active=ai for LLM extraction.
+  ai:
+    model:
+      chat: none
+      embedding: none
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+commerce:
+  mode: ${COMMERCE_MODE:mock} # mock | shopify
+  merchant-origin: ${SHOPIFY_MERCHANT_ORIGIN:https://demo.myshopify.com}
+  agent-profile-url: ${UCP_AGENT_PROFILE_URL:https://shopify.dev/ucp/agent-profiles/examples/2026-08-25/valid-with-capabilities.json}
+  mongo-uri: ${MONGODB_URI:mongodb://localhost:27017}
+  mongo-database: commerce_graph
+  checkout-bearer-token: ${SHOPIFY_CHECKOUT_BEARER_TOKEN:}

@@ -1,0 +1,29 @@
+### Use a mesma conversa para preservar contexto
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{"conversationId":"demo-1","command":"SEARCH","query":"tênis"}
+
+###
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{"conversationId":"demo-1","command":"ADD_TO_CART","productReference":"2","quantity":1}
+
+###
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{"conversationId":"demo-1","command":"VIEW_CART"}
+
+###
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{"conversationId":"demo-1","command":"CREATE_CHECKOUT"}
+
+###
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{"conversationId":"demo-2","message":"Quero um tênis"}

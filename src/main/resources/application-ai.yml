@@ -1,0 +1,11 @@
+spring:
+  ai:
+    model:
+      chat: openai
+      embedding: none
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: ${OPENAI_MODEL:gpt-4.1-mini}
+          temperature: 0

@@ -1,0 +1,29 @@
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  app:
+    profiles: [app]
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      COMMERCE_MODE: ${COMMERCE_MODE:-mock}
+      SHOPIFY_MERCHANT_ORIGIN: ${SHOPIFY_MERCHANT_ORIGIN:-https://demo.myshopify.com}
+      SHOPIFY_CHECKOUT_BEARER_TOKEN: ${SHOPIFY_CHECKOUT_BEARER_TOKEN:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-default}
+    depends_on:
+      mongo:
+        condition: service_healthy
+volumes:
+  mongo_data:
